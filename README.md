@@ -48,7 +48,7 @@ TaskBot is a Telegram bot designed to help you manage tasks with:
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-username/task_bot.git
+   git clone https://github.com/bilalalissa/Telegram-Tasks-Bot.git
    cd task_bot
    ```
 2. **Create and activate a virtual environment**:
