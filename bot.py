@@ -811,7 +811,7 @@ async def aedit(update: Update, ctx: CallbackContext):
     args = ctx.args
     if not args or not args[0].isdigit():
         return await update.message.reply_text(
-            "Usage: /aedit TASK_ID [desc=NEW_DESCRIPTION] [due=YYYY-MM-DD HH:MM] [topic=NEW_TOPIC] [subject=NEW_SUBJECT]",
+            "Usage: /aedit TASK_ID [desc=NEW_DESCRIPTION] [due=YYYY-MM-DD HH:MM] [topic=NEW_TOPIC] [subject=NEW_SUBJECT] [interval=INTERVAL] (e.g. interval=1 hr)",
             parse_mode=ParseMode.MARKDOWN
         )
     tid = int(args[0])
@@ -820,10 +820,12 @@ async def aedit(update: Update, ctx: CallbackContext):
     due = None
     topic = None
     subject = None
-    desc_match = re.search(r"desc=([^\]]+?)(?= due=| topic=| subject=|$)", rest)
-    due_match = re.search(r"due=([^\]]+?)(?= desc=| topic=| subject=|$)", rest)
-    topic_match = re.search(r"topic=([^\]]+?)(?= desc=| due=| subject=|$)", rest)
-    subject_match = re.search(r"subject=([^\]]+?)(?= desc=| due=| topic=|$)", rest)
+    interval = None
+    desc_match = re.search(r"desc=([^\]]+?)(?= due=| topic=| subject=| interval=|$)", rest)
+    due_match = re.search(r"due=([^\]]+?)(?= desc=| topic=| subject=| interval=|$)", rest)
+    topic_match = re.search(r"topic=([^\]]+?)(?= desc=| due=| subject=| interval=|$)", rest)
+    subject_match = re.search(r"subject=([^\]]+?)(?= desc=| due=| topic=| interval=|$)", rest)
+    interval_match = re.search(r"interval=([^\]]+?)(?= desc=| due=| topic=| subject=|$)", rest)
     if desc_match:
         desc = desc_match.group(1).strip()
     if due_match:
@@ -832,14 +834,17 @@ async def aedit(update: Update, ctx: CallbackContext):
         topic = topic_match.group(1).strip()
     if subject_match:
         subject = subject_match.group(1).strip()
-    if desc is None and due is None and topic is None and subject is None:
+    if interval_match:
+        interval = interval_match.group(1).strip()
+    if desc is None and due is None and topic is None and subject is None and interval is None:
         return await update.message.reply_text(
-            "Nothing to edit. Provide desc=, due=, topic=, or subject=.",
+            "Nothing to edit. Provide desc=, due=, topic=, subject=, or interval=.",
             parse_mode=ParseMode.MARKDOWN
         )
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute("SELECT id FROM tasks WHERE id=?", (tid,))
-    if not cur.fetchone():
+    cur = conn.execute("SELECT id, remind_at FROM tasks WHERE id=?", (tid,))
+    row = cur.fetchone()
+    if not row:
         conn.close()
         return await update.message.reply_text("Task not found.")
     updates = []
@@ -862,10 +867,35 @@ async def aedit(update: Update, ctx: CallbackContext):
         updates.append("subject=?")
         params.append(subject)
     params.append(tid)
-    conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id=?", params)
-    conn.commit()
+    if updates:
+        conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id=?", params)
+        conn.commit()
+    # Set interval if provided, else prompt
+    if interval is not None:
+        mins = parse_interval_label(interval)
+        if mins is None:
+            conn.close()
+            return await update.message.reply_text("❌ Could not parse interval. Use e.g. '30 min', '1 hr', or 'off'. Example: interval=30 min")
+        set_question_prefs(tid, mins, 1 if mins > 0 else 0)
+        await update.message.reply_text(f"Task {tid} updated. Reminding interval: {interval}")
+    else:
+        # Prompt for interval
+        remind_at = row[1]
+        if remind_at:
+            dt2 = dateparser.parse(remind_at)
+            if dt2:
+                from telegram import ReplyKeyboardMarkup
+                intervals = get_dynamic_intervals(dt2)
+                keyboard = [[str(i) + ' min' if i < 60 else (str(i//60) + ' hr' if i < 1440 else (str(i//1440) + ' day' if i < 10080 else (str(i//10080) + ' wk' if i < 43200 else (str(i//43200) + ' mo' if i < 525600 else str(i//525600) + ' yr')))) for i in intervals], ['off']]
+                reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+                await update.message.reply_text(
+                    f"Choose new reminder/question interval for task {tid}:",
+                    reply_markup=reply_markup
+                )
+                interval_task_map[update.effective_user.id] = tid
+        else:
+            await update.message.reply_text(f"Task {tid} updated.")
     conn.close()
-    await update.message.reply_text(f"Task {tid} updated.")
 
 # Admin Done (global)
 @block_check
@@ -1568,7 +1598,7 @@ async def aadd(update: Update, ctx: CallbackContext):
     args = ctx.args
     if not args or not args[0].isdigit():
         return await update.message.reply_text(
-            "Usage: /aadd USER_ID [topic=TOPIC] [subject=SUBJECT] DESCRIPTION at YYYY-MM-DD HH:MM",
+            "Usage: /aadd USER_ID [topic=TOPIC] [subject=SUBJECT] DESCRIPTION at YYYY-MM-DD HH:MM [interval=INTERVAL] (e.g. interval=30 min)",
             parse_mode="HTML"
         )
     user_id = int(args[0])
@@ -1576,18 +1606,24 @@ async def aadd(update: Update, ctx: CallbackContext):
     import re
     topic = None
     subject = None
+    interval = None
+    # Extract topic, subject, interval
     topic_match = re.search(r"topic=([^\]]+)", text)
     subject_match = re.search(r"subject=([^\]]+)", text)
+    interval_match = re.search(r"interval=([^\]]+)", text)
     if topic_match:
         topic = topic_match.group(1).strip()
         text = re.sub(r"topic=[^\]]+", "", text)
     if subject_match:
         subject = subject_match.group(1).strip()
         text = re.sub(r"subject=[^\]]+", "", text)
+    if interval_match:
+        interval = interval_match.group(1).strip()
+        text = re.sub(r"interval=[^\]]+", "", text)
     text = text.strip()
     if " at " not in text:
         return await update.message.reply_text(
-            "❌ Usage: /aadd USER_ID [topic=TOPIC] [subject=SUBJECT] DESCRIPTION at YYYY-MM-DD HH:MM",
+            "❌ Usage: /aadd USER_ID [topic=TOPIC] [subject=SUBJECT] DESCRIPTION at YYYY-MM-DD HH:MM [interval=INTERVAL]",
             parse_mode="HTML"
         )
     desc, _, timestr = text.rpartition(" at ")
@@ -1597,16 +1633,38 @@ async def aadd(update: Update, ctx: CallbackContext):
         return await update.message.reply_text("❌ Could not parse date/time.")
     chat_id = update.effective_chat.id
     task_id, user_task_id = add_task(chat_id, user_id, desc, dt, topic, subject)
-    set_question_prefs(task_id, 0, 0) # Default to off for new tasks
-    details = f"_" + desc + "_"
-    if topic:
-        details = f"[Topic: {topic}] " + details
-    if subject:
-        details = f"[Subject: {subject}] " + details
-    await update.message.reply_text(
-        f"✅ Task *#{user_task_id}* for user {user_id} scheduled: {details} at {dt}",
-        parse_mode="Markdown"
-    )
+    # If interval provided, set it, else prompt
+    if interval:
+        mins = parse_interval_label(interval)
+        if mins is None:
+            return await update.message.reply_text("❌ Could not parse interval. Use e.g. '30 min', '1 hr', or 'off'.")
+        set_question_prefs(task_id, mins, 1 if mins > 0 else 0)
+        details = f"_" + desc + "_"
+        if topic:
+            details = f"[Topic: {topic}] " + details
+        if subject:
+            details = f"[Subject: {subject}] " + details
+        await update.message.reply_text(
+            f"✅ Task *#{user_task_id}* for user {user_id} scheduled: {details} at {dt}\nReminding interval: {interval}",
+            parse_mode="Markdown"
+        )
+    else:
+        # Prompt for interval
+        from telegram import ReplyKeyboardMarkup
+        intervals = get_dynamic_intervals(dt)
+        keyboard = [[str(i) + ' min' if i < 60 else (str(i//60) + ' hr' if i < 1440 else (str(i//1440) + ' day' if i < 10080 else (str(i//10080) + ' wk' if i < 43200 else (str(i//43200) + ' mo' if i < 525600 else str(i//525600) + ' yr')))) for i in intervals], ['off']]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        details = f"_" + desc + "_"
+        if topic:
+            details = f"[Topic: {topic}] " + details
+        if subject:
+            details = f"[Subject: {subject}] " + details
+        await update.message.reply_text(
+            f"✅ Task *#{user_task_id}* for user {user_id} scheduled: {details} at {dt}\nChoose reminder/question interval:",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+        interval_task_map[update.effective_user.id] = task_id
 
 # Helper: generate dynamic interval options based on due date
 
